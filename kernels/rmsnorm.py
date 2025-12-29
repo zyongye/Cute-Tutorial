@@ -40,8 +40,8 @@ class RMSNorm:
         # setup copy atom
         tiler_mn = (4, 4096)
         tv_layout = cute.make_layout(
-            ((32, 4), (4, 32)),
-            stride=((16, 1), (4, 512))
+            ((32, 4), (8, 16)), 
+            stride=((32, 1), (4, 1024)),
         )
         # expand 1D tensors
         mW_expand_layout = cute.make_layout((shape[0], mW.shape[0]), stride=(0, mW.stride[0]))
@@ -88,9 +88,9 @@ class RMSNorm:
 
         print(f"[DSL INFO]  blkW = {blkW}")
 
-        copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=64)
-        copy_atom_load_W = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gW.element_type, num_bits_per_copy=64)
-        copy_atom_store_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=64)
+        copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
+        copy_atom_load_W = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gW.element_type, num_bits_per_copy=128)
+        copy_atom_store_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=128)
 
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
         thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
@@ -169,7 +169,7 @@ def _rms_norm_fwd(
         fn = lambda: compiled_kernel(out, x, scale, eps)
         M, N = x.shape
         avg_time = triton.testing.do_bench(fn, warmup=2, rep=200)
-        mem_bw = ((M * N * 2 + N) * x.element_size() // 8) / (avg_time / 1000) / 1e9
+        mem_bw = ((M * N * 2 + N) * x.element_size()) / (avg_time / 1000) / 1e9
         print(f"Kernel execution time: {avg_time:.4f} ms")
         print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
