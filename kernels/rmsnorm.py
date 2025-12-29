@@ -30,6 +30,7 @@ class RMSNorm:
         self,
         mO: cute.Tensor,
         mX: cute.Tensor,
+        mRes: cute.Tensor | None,
         mW: cute.Tensor,
         eps: cute.Float32,
         stream: cuda.CUstream,
@@ -51,15 +52,15 @@ class RMSNorm:
         idX = cute.make_identity_tensor(mX.shape)
 
 
-        gO, gX, gW, cX = [
-            cute.zipped_divide(mT, tiler_mn)
-            for mT in (mO, mX, mW_expand, idX)
+        gO, gX, gRes, gW, cX = [
+            cute.zipped_divide(mT, tiler_mn) if cutlass.const_expr(mT is not None) else None
+            for mT in (mO, mX, mRes, mW_expand, idX)
         ]
 
         print(f"gX: {gX.type}")
 
         self.kernel(
-            gO, gX, gW, cX, mX.shape, tiler_mn, tv_layout, eps,
+            gO, gX, gRes, gW, cX, mX.shape, tiler_mn, tv_layout, eps,
         ).launch(
             grid=[cute.ceil_div(shape[0], 4), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
@@ -70,7 +71,8 @@ class RMSNorm:
     def kernel(
         self,
         gO: cute.Tensor,
-        gX: cute.Tensor, 
+        gX: cute.Tensor,
+        gRes: cute.Tensor | None, 
         gW: cute.Tensor,
         cX: cute.Tensor,
         shape: cute.Shape,
@@ -81,9 +83,9 @@ class RMSNorm:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
-        blkO, blkX, blkW, blkCrd = [
-            gT[(None, None), bidx] 
-            for gT in (gO, gX, gW, cX)
+        blkO, blkX, blkRes, blkW, blkCrd = [
+            gT[(None, None), bidx] if cutlass.const_expr(gT is not None) else None
+            for gT in (gO, gX, gRes, gW, cX)
         ]
 
         print(f"[DSL INFO]  blkW = {blkW}")
@@ -98,6 +100,11 @@ class RMSNorm:
 
         tXgX = thr_copy_X.partition_S(blkX)
         tXrX = cute.make_fragment_like(tXgX)
+        if cutlass.const_expr(blkRes is not None):
+            tXgRes = thr_copy_X.partition_S(blkRes)
+            tXrRes = cute.make_fragment_like(tXgRes)
+        else:
+            tXgRes, tXrRes = None, None
         tXgW = thr_copy_W.partition_S(blkW)
         tXrW = cute.make_fragment_like(tXgW)
         tXgO = thr_copy_O.partition_D(blkO)
@@ -110,6 +117,8 @@ class RMSNorm:
         
         if row < shape[0]:
             cute.copy(copy_atom_load_X, tXgX, tXrX)
+            if cutlass.const_expr(tXgRes is not None):
+                cute.copy(copy_atom_load_X, tXgRes, tXrRes)
             cute.copy(copy_atom_load_W, tXgW, tXrW)
         
         x = tXrX.load().to(self.reduction_dtype)
@@ -130,6 +139,9 @@ class RMSNorm:
 
         y *= tXrW.load().to(self.reduction_dtype)
         
+        if cutlass.const_expr(tXrRes is not None):
+            y += tXrRes.load().to(self.reduction_dtype)
+        
         # store the result
         tXrO.store(y.to(tXrO.element_type))
 
@@ -140,6 +152,7 @@ class RMSNorm:
 def _rms_norm_fwd(
     out: torch.Tensor,
     x: torch.Tensor,
+    res: torch.Tensor | None,
     scale: torch.Tensor,
     eps: float = 1e-5,
     benchmark: bool = False,
@@ -154,6 +167,7 @@ def _rms_norm_fwd(
         RMSNorm(x_fake_tensor.element_type, dim),
         x_fake_tensor,
         x_fake_tensor,
+        x_fake_tensor if res is not None else None,
         w_fake_tensor,
         cutlass.Float32(0.0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -162,20 +176,21 @@ def _rms_norm_fwd(
 
     # call
     compiled_kernel(
-        out, x, scale, eps,
+        out, x, res, scale, eps,
     )
 
     if benchmark:
-        fn = lambda: compiled_kernel(out, x, scale, eps)
+        fn = lambda: compiled_kernel(out, x, res, scale, eps)
         M, N = x.shape
         avg_time = triton.testing.do_bench(fn, warmup=2, rep=200)
-        mem_bw = ((M * N * 2 + N) * x.element_size()) / (avg_time / 1000) / 1e9
+        mem_bw = ((M * N * (2 + (1 if res is not None else 0)) + N) * x.element_size()) / (avg_time / 1000) / 1e9
         print(f"Kernel execution time: {avg_time:.4f} ms")
         print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
 
 def cute_rms_norm(
     x: torch.Tensor,
+    res: torch.Tensor | None,
     scale: torch.Tensor,
     eps: float = 1e-5,
 ):
@@ -184,6 +199,7 @@ def cute_rms_norm(
     _rms_norm_fwd(
         out, 
         x, 
+        res,
         scale,
         eps,
         benchmark=True,
@@ -194,6 +210,7 @@ def cute_rms_norm(
 @torch.compile
 def torch_rms_norm(
     x: torch.Tensor,
+    res: torch.Tensor | None,
     scale: torch.Tensor,
     eps: float = 1e-5,
 ):
@@ -203,19 +220,20 @@ def torch_rms_norm(
     
     t, dtype = x.float(), x.dtype
     t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + eps)
-    return (t * scale).to(dtype)
+    return (t * scale + res).to(dtype) if res is not None else (t * scale).to(dtype)
 
 
 def main():
     L = 16384
     d = 4096
     device = "cuda"
+    res = torch.randn(L, d, dtype=torch.bfloat16, device=device)
     x = torch.randn(L, d, dtype=torch.bfloat16, device=device)
     scale = torch.randn(d, dtype=torch.bfloat16, device=device)
     
-    torch_result = torch_rms_norm(x, scale)
+    torch_result = torch_rms_norm(x, res, scale)
 
-    cutedsl_result = cute_rms_norm(x, scale)
+    cutedsl_result = cute_rms_norm(x, res, scale)
     
     torch.testing.assert_close(torch_result, cutedsl_result)
 
