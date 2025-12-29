@@ -1,6 +1,4 @@
 import operator
-import math
-from typing import Callable
 
 import torch
 
@@ -10,13 +8,6 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass.cute.runtime import make_fake_compact_tensor as fake_tensor
-
-
-@cute.jit
-def warp_reduce(val: cute.Numeric, op: Callable, width: cutlass.Constexpr = cute.arch.WARP_SIZE) -> cute.Numeric:
-    for i in range(int(math.log2(width))):
-        val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
-    return val
 
 class RMSNorm:
     
@@ -127,7 +118,7 @@ class RMSNorm:
             cute.ReductionOp.ADD, 0.0, reduction_profile=0,
         )
 
-        sum_square_x = warp_reduce(
+        sum_square_x = cute.arch.warp_reduction(
             square_x,
             operator.add,
         )
