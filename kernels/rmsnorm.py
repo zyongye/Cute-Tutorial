@@ -1,6 +1,7 @@
 import operator
 
 import torch
+import triton
 
 import cuda.bindings.driver as cuda
 
@@ -141,6 +142,7 @@ def _rms_norm_fwd(
     x: torch.Tensor,
     scale: torch.Tensor,
     eps: float = 1e-5,
+    benchmark: bool = False,
 ):
     # compile rmsnorm
     batch_sym = cute.sym_int()
@@ -163,6 +165,15 @@ def _rms_norm_fwd(
         out, x, scale, eps,
     )
 
+    if benchmark:
+        fn = lambda: compiled_kernel(out, x, scale, eps)
+        M, N = x.shape
+        avg_time = triton.testing.do_bench(fn, warmup=2, rep=200)
+        mem_bw = ((M * N * 2 + N) * x.element_size() // 8) / (avg_time / 1000) / 1e9
+        print(f"Kernel execution time: {avg_time:.4f} ms")
+        print(f"Mem throughput: {mem_bw:.2f} GB/s")
+
+
 def cute_rms_norm(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -175,11 +186,12 @@ def cute_rms_norm(
         x, 
         scale,
         eps,
+        benchmark=True,
     )
 
     return out
     
-
+@torch.compile
 def torch_rms_norm(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -195,7 +207,7 @@ def torch_rms_norm(
 
 
 def main():
-    L = 10
+    L = 16384
     d = 4096
     device = "cuda"
     x = torch.randn(L, d, dtype=torch.bfloat16, device=device)
