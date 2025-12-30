@@ -1,2 +1,4 @@
 torch
 nvidia-cutlass-dsl
+torch-c-dlpack-ext
+apache-tvm-ffi
