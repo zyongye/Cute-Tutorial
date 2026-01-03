@@ -47,20 +47,12 @@ class RMSNorm:
         # expand 1D tensors
         mW_expand_layout = cute.make_layout((shape[0], mW.shape[0]), stride=(0, mW.stride[0]))
         mW_expand = cute.make_tensor(mW.iterator, mW_expand_layout)
-
-        # call kernel
+        
         idX = cute.make_identity_tensor(mX.shape)
 
-
-        gO, gX, gRes, gW, cX = [
-            cute.zipped_divide(mT, tiler_mn) if cutlass.const_expr(mT is not None) else None
-            for mT in (mO, mX, mRes, mW_expand, idX)
-        ]
-
-        print(f"gX: {gX.type}")
-
+        # call kernel
         self.kernel(
-            gO, gX, gRes, gW, cX, mX.shape, tiler_mn, tv_layout, eps,
+            mO, mX, mRes, mW_expand, idX, eps, mX.shape, tiler_mn, tv_layout,
         ).launch(
             grid=[cute.ceil_div(shape[0], 4), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
@@ -70,56 +62,54 @@ class RMSNorm:
     @cute.kernel
     def kernel(
         self,
-        gO: cute.Tensor,
-        gX: cute.Tensor,
-        gRes: cute.Tensor | None, 
-        gW: cute.Tensor,
-        cX: cute.Tensor,
+        mO: cute.Tensor,
+        mX: cute.Tensor,
+        mRes: cute.Tensor | None, 
+        mW: cute.Tensor,
+        idX: cute.Tensor,
+        eps: cutlass.Float32,
         shape: cute.Shape,
         tiler_mn: cute.Shape,
         tv_layout: cute.Layout,
-        eps: cutlass.Float32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
-        blkO, blkX, blkRes, blkW, blkCrd = [
-            gT[(None, None), bidx] if cutlass.const_expr(gT is not None) else None
-            for gT in (gO, gX, gRes, gW, cX)
+        gO, gX, gRes, cX = [
+            cute.local_tile(mT, tiler_mn, (bidx, cutlass.const_expr(0))) if cutlass.const_expr(mT is not None) else None
+            for mT in [mO, mX, mRes, idX]
         ]
 
-        print(f"[DSL INFO]  blkW = {blkW}")
+        gW = cute.local_tile(mW, tiler_mn, (0, cutlass.const_expr(0)))
 
-        copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
-        copy_atom_load_W = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gW.element_type, num_bits_per_copy=128)
-        copy_atom_store_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=128)
+        print(f"[DSL INFO]  blkW = {gW}")
 
-        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_O = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
+        copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
 
-        tXgX = thr_copy_X.partition_S(blkX)
+        thr_copy_X = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
+
+        tXgX = thr_copy_X.partition_S(gX)
         tXrX = cute.make_fragment_like(tXgX)
-        if cutlass.const_expr(blkRes is not None):
-            tXgRes = thr_copy_X.partition_S(blkRes)
+        if cutlass.const_expr(gRes is not None):
+            tXgRes = thr_copy_X.partition_S(gRes)
             tXrRes = cute.make_fragment_like(tXgRes)
         else:
             tXgRes, tXrRes = None, None
-        tXgW = thr_copy_W.partition_S(blkW)
+        tXgW = thr_copy_X.partition_S(gW)
         tXrW = cute.make_fragment_like(tXgW)
-        tXgO = thr_copy_O.partition_D(blkO)
+        tXgO = thr_copy_X.partition_D(gO)
         tXrO = cute.make_fragment_like(tXgO)
-        tXcX = thr_copy_X.partition_S(blkCrd)[(0, None), None, None]
+        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
         row = tXcX[0][0]
 
         print(f"[DSL INFO]  tXgW = {tXgW.type}")
         print(f"[DSL INFO]  tXgW = {tXrW.type}")
         
         if row < shape[0]:
-            cute.copy(copy_atom_load_X, tXgX, tXrX)
+            cute.copy(copy_atom, tXgX, tXrX)
             if cutlass.const_expr(tXgRes is not None):
-                cute.copy(copy_atom_load_X, tXgRes, tXrRes)
-            cute.copy(copy_atom_load_W, tXgW, tXrW)
+                cute.copy(copy_atom, tXgRes, tXrRes)
+            cute.copy(copy_atom, tXgW, tXrW)
         
         x = tXrX.load().to(self.reduction_dtype)
         square_x = x * x
@@ -146,7 +136,7 @@ class RMSNorm:
         tXrO.store(y.to(tXrO.element_type))
 
         if row < shape[0]:
-            cute.copy(copy_atom_store_O, tXrO, tXgO)
+            cute.copy(copy_atom, tXrO, tXgO)
 
 
 def _rms_norm_fwd(
