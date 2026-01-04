@@ -75,6 +75,19 @@ class RMSNorm:
         bidx, _, _ = cute.arch.block_idx()
         shape = mX.shape
 
+        smem = cutlass.utils.SmemAllocator()
+        sX = smem.allocate_tensor(
+            mX.element_type,
+            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+            byte_alignment=16,
+        )
+        if cutlass.const_expr(mRes is not None):
+            sRes = smem.allocate_tensor(
+                mRes.element_type,
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+                byte_alignment=16,
+            )
+
         gO, gX, gRes, cX = [
             cute.local_tile(mT, tiler_mn, (bidx, cutlass.const_expr(0))) if cutlass.const_expr(mT is not None) else None
             for mT in [mO, mX, mRes, idX]
@@ -90,9 +103,11 @@ class RMSNorm:
         thr_copy_X = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
 
         tXgX = thr_copy_X.partition_S(gX)
+        tXsX = thr_copy_X.partition_D(sX)
         tXrX = cute.make_fragment_like(tXgX)
         if cutlass.const_expr(gRes is not None):
             tXgRes = thr_copy_X.partition_S(gRes)
+            tXsRes = thr_copy_X.partition_D(sRes)
             tXrRes = cute.make_fragment_like(tXgRes)
         else:
             tXgRes, tXrRes = None, None
@@ -122,10 +137,14 @@ class RMSNorm:
         print(f"[DSL INFO]  tXpX = {tXpX.type}")
         
         if row < shape[0]:
-            cute.copy(copy_atom, tXgX, tXrX, pred=tXpX)
+            cute.copy(copy_atom, tXgX, tXsX, pred=tXpX)
             if cutlass.const_expr(tXgRes is not None):
-                cute.copy(copy_atom, tXgRes, tXrRes, pred=tXpX)
+                cute.copy(copy_atom, tXgRes, tXsRes, pred=tXpX)
             cute.copy(copy_atom, tXgW, tXrW, pred=tXpX)
+
+        cute.autovec_copy(tXsX, tXrX)
+        if cutlass.const_expr(tXgRes is not None):
+            cute.autovec_copy(tXsRes, tXrRes)
         
         x = tXrX.load().to(self.reduction_dtype)
         square_x = x * x
