@@ -98,9 +98,12 @@ class RMSNorm:
         print(f"[DSL INFO]  gW = {gW}")
         print(f"[DSL INFO]  mW = {mW}")
 
-        copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
+        copy_atom_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128)
+        
+        # We reuse this atom for loading scalar and store result, since it can go directly from rmem to gmem
+        copy_atom_sync = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
 
-        thr_copy_X = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_X = cute.make_tiled_copy(copy_atom_async, tv_layout, tiler_mn).get_slice(tidx)
 
         tXgX = thr_copy_X.partition_S(gX)
         tXsX = thr_copy_X.partition_D(sX)
@@ -137,10 +140,13 @@ class RMSNorm:
         print(f"[DSL INFO]  tXpX = {tXpX.type}")
         
         if row < shape[0]:
-            cute.copy(copy_atom, tXgX, tXsX, pred=tXpX)
+            cute.copy(copy_atom_async, tXgX, tXsX, pred=tXpX)
             if cutlass.const_expr(tXgRes is not None):
-                cute.copy(copy_atom, tXgRes, tXsRes, pred=tXpX)
-            cute.copy(copy_atom, tXgW, tXrW, pred=tXpX)
+                cute.copy(copy_atom_async, tXgRes, tXsRes, pred=tXpX)
+            cute.copy(copy_atom_sync, tXgW, tXrW, pred=tXpX)
+        
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
 
         cute.autovec_copy(tXsX, tXrX)
         if cutlass.const_expr(tXgRes is not None):
@@ -171,7 +177,7 @@ class RMSNorm:
         tXrO.store(y.to(tXrO.element_type))
 
         if row < shape[0]:
-            cute.copy(copy_atom, tXrO, tXgO, pred=tXpX)
+            cute.copy(copy_atom_sync, tXrO, tXgO, pred=tXpX)
 
 
 def _rms_norm_fwd(
