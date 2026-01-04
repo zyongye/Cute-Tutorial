@@ -52,7 +52,7 @@ class RMSNorm:
 
         # call kernel
         self.kernel(
-            mO, mX, mRes, mW_expand, idX, eps, mX.shape, tiler_mn, tv_layout,
+            mO, mX, mRes, mW_expand, idX, eps, tiler_mn, tv_layout,
         ).launch(
             grid=[cute.ceil_div(shape[0], 4), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
@@ -68,12 +68,12 @@ class RMSNorm:
         mW: cute.Tensor,
         idX: cute.Tensor,
         eps: cutlass.Float32,
-        shape: cute.Shape,
         tiler_mn: cute.Shape,
         tv_layout: cute.Layout,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+        shape = mX.shape
 
         gO, gX, gRes, cX = [
             cute.local_tile(mT, tiler_mn, (bidx, cutlass.const_expr(0))) if cutlass.const_expr(mT is not None) else None
@@ -82,7 +82,8 @@ class RMSNorm:
 
         gW = cute.local_tile(mW, tiler_mn, (0, cutlass.const_expr(0)))
 
-        print(f"[DSL INFO]  blkW = {gW}")
+        print(f"[DSL INFO]  gW = {gW}")
+        print(f"[DSL INFO]  mW = {mW}")
 
         copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
 
@@ -99,17 +100,32 @@ class RMSNorm:
         tXrW = cute.make_fragment_like(tXgW)
         tXgO = thr_copy_X.partition_D(gO)
         tXrO = cute.make_fragment_like(tXgO)
-        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
+        tXcX = thr_copy_X.partition_S(cX)
         row = tXcX[0][0]
 
-        print(f"[DSL INFO]  tXgW = {tXgW.type}")
-        print(f"[DSL INFO]  tXgW = {tXrW.type}")
+        tXpX = cute.make_rmem_tensor(
+            cute.make_layout(
+                (cute.size(tXcX, mode=[0, 1]), cute.size(tXcX, mode=[1]), cute.size(tXcX, mode=[2])),
+                stride=(cute.size(tXcX, mode=[2]), 0, 1),
+            ),
+            cutlass.Boolean,
+        )
+
+        for rest_v in cutlass.range_constexpr(tXpX.shape[0]):
+            for rest_k in cutlass.range_constexpr(tXpX.shape[2]):
+                tXpX[rest_v, 0, rest_k] = cute.elem_less(
+                    tXcX[(0, rest_v), 0, rest_k][1], shape[1]
+                )
+
+        print(f"[DSL INFO]  tXgX = {tXgX.type}")
+        print(f"[DSL INFO]  tXrX = {tXrX.type}")
+        print(f"[DSL INFO]  tXpX = {tXpX.type}")
         
         if row < shape[0]:
-            cute.copy(copy_atom, tXgX, tXrX)
+            cute.copy(copy_atom, tXgX, tXrX, pred=tXpX)
             if cutlass.const_expr(tXgRes is not None):
-                cute.copy(copy_atom, tXgRes, tXrRes)
-            cute.copy(copy_atom, tXgW, tXrW)
+                cute.copy(copy_atom, tXgRes, tXrRes, pred=tXpX)
+            cute.copy(copy_atom, tXgW, tXrW, pred=tXpX)
         
         x = tXrX.load().to(self.reduction_dtype)
         square_x = x * x
@@ -136,7 +152,7 @@ class RMSNorm:
         tXrO.store(y.to(tXrO.element_type))
 
         if row < shape[0]:
-            cute.copy(copy_atom, tXrO, tXgO)
+            cute.copy(copy_atom, tXrO, tXgO, pred=tXpX)
 
 
 def _rms_norm_fwd(
