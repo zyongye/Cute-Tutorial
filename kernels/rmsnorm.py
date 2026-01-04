@@ -153,6 +153,8 @@ class RMSNorm:
             cute.autovec_copy(tXsRes, tXrRes)
         
         x = tXrX.load().to(self.reduction_dtype)
+        if cutlass.const_expr(tXrRes is not None):
+            x += tXrRes.load().to(self.reduction_dtype)
         square_x = x * x
 
         square_x = square_x.reduce(
@@ -169,9 +171,6 @@ class RMSNorm:
         y = x * rstd
 
         y *= tXrW.load().to(self.reduction_dtype)
-        
-        if cutlass.const_expr(tXrRes is not None):
-            y += tXrRes.load().to(self.reduction_dtype)
         
         # store the result
         tXrO.store(y.to(tXrO.element_type))
@@ -250,8 +249,10 @@ def torch_rms_norm(
     assert d_model == d_model_
     
     t, dtype = x.float(), x.dtype
+    if res is not None:
+        t += res
     t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + eps)
-    return (t * scale + res).to(dtype) if res is not None else (t * scale).to(dtype)
+    return (t * scale).to(dtype)
 
 
 def main():
