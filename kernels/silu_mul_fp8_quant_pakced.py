@@ -98,6 +98,8 @@ class SiluMulFP8QuantPackedKernel:
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
         self.num_sf_blocks_per_row = self.hidden_size // self.block_size
 
+        self.NUM_CHUNK = 2
+
     @staticmethod
     def _make_tv_layout(
         threads_per_row: int,
@@ -131,11 +133,11 @@ class SiluMulFP8QuantPackedKernel:
             self.threads_per_row,
             self.rows_per_block,
             self.vec_size,
-            self.num_vec_blocks,
+            self.num_vec_blocks // self.NUM_CHUNK,
         )
 
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
-        tiler_mn = (self.rows_per_block, self.cols_per_tile)
+        tiler_mn = (self.rows_per_block, self.cols_per_tile // self.NUM_CHUNK)
 
         N = self.hidden_size
         input_layout = cute.make_layout((M, N), stride=(N * 2, 1))
@@ -198,91 +200,95 @@ class SiluMulFP8QuantPackedKernel:
 
         idX = cute.make_identity_tensor(mX.shape)
 
-        gX = cute.local_tile(mX, tiler_mn, (bidx, cutlass.const_expr(0)))
-        gG = cute.local_tile(mG, tiler_mn, (bidx, cutlass.const_expr(0)))
-        gO = cute.local_tile(mO, tiler_mn, (bidx, cutlass.const_expr(0)))
+        for chunk_ids in range(self.NUM_CHUNK):
 
-        cX = cute.local_tile(idX, tiler_mn, (bidx, cutlass.const_expr(0)))
+            gX = cute.local_tile(mX, tiler_mn, (bidx, chunk_ids))
+            gG = cute.local_tile(mG, tiler_mn, (bidx, chunk_ids))
+            gO = cute.local_tile(mO, tiler_mn, (bidx, chunk_ids))
 
-        copy_atom_load_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=COPY_BITS)
+            cX = cute.local_tile(idX, tiler_mn, (bidx, chunk_ids))
 
-        copy_atom_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=COPY_BITS // 2)
+            copy_atom_load_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=COPY_BITS)
 
-        tiled_copy_load = cute.make_tiled_copy(copy_atom_load_async, tv_layout, tiler_mn)
-        tiled_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn)
+            copy_atom_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=COPY_BITS // 2)
 
-        thr_copy_X = tiled_copy_load.get_slice(tidx)
-        thr_copy_O = tiled_copy_store.get_slice(tidx)
+            tiled_copy_load = cute.make_tiled_copy(copy_atom_load_async, tv_layout, tiler_mn)
+            tiled_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn)
 
-        tXgX = thr_copy_X.partition_S(gX)
-        tXsX = thr_copy_X.partition_D(sX)
-        tXgG = thr_copy_X.partition_S(gG)
-        tXsG = thr_copy_X.partition_D(sG)
-        tXcX = thr_copy_X.partition_S(cX)
+            thr_copy_X = tiled_copy_load.get_slice(tidx)
+            thr_copy_O = tiled_copy_store.get_slice(tidx)
 
-        tXgO = thr_copy_O.partition_D(gO)
+            tXgX = thr_copy_X.partition_S(gX)
+            tXsX = thr_copy_X.partition_D(sX)
+            tXgG = thr_copy_X.partition_S(gG)
+            tXsG = thr_copy_X.partition_D(sG)
+            tXcX = thr_copy_X.partition_S(cX)
 
-        tXrX = cute.make_fragment_like(tXgX)
-        tXrG = cute.make_fragment_like(tXgG)
-        tXrO = cute.make_fragment_like(tXgO)
+            tXgO = thr_copy_O.partition_D(gO)
 
-        act_result = cute.make_fragment_like(tXgO, dtype=Float32)
+            tXrX = cute.make_fragment_like(tXgX)
+            tXrG = cute.make_fragment_like(tXgG)
+            tXrO = cute.make_fragment_like(tXgO)
 
-        tXpX = predicate_k(tXcX, limit=H)
-        row_coord = tXcX[(0, 0), 0, 0]
-        row_in_bounds = row_coord[0] < M
+            # act_result = cute.make_fragment_like(tXgO, dtype=Float32)
 
-        if row_in_bounds:
-            cute.copy(copy_atom_load_async, tXgX, tXsX, pred=tXpX)
-            cute.copy(copy_atom_load_async, tXgG, tXsG, pred=tXpX)
+            tXpX = predicate_k(tXcX, limit=H)
+            row_coord = tXcX[(0, 0), 0, 0]
+            row_in_bounds = row_coord[0] < M
 
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
+            if row_in_bounds:
+                cute.copy(copy_atom_load_async, tXgX, tXsX, pred=tXpX)
+                cute.copy(copy_atom_load_async, tXgG, tXsG, pred=tXpX)
 
-        cute.autovec_copy(tXsX, tXrX)
-        cute.autovec_copy(tXsG, tXrG)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
 
-        max_val: Float32 = 0.0
+            cute.autovec_copy(tXsX, tXrX)
+            cute.autovec_copy(tXsG, tXrG)
 
-        # Loop Reduce
-        for scale_idx in range(tXrX.shape[0][1] // 2):
-            # one thread has 8 element, 16 threads got one scale value
-            # one output int32 has 4 ue8m0 scale
-            # so 2 thread loop will produce 1 int
-            for pos_in_one_scale in cutlass.range_constexpr(2):
-                j = scale_idx * 2 + pos_in_one_scale
-                for i in cutlass.range_constexpr(tXrX.shape[0][0]):
-                    act_result[(i, j), 0, 0] = silu(tXrX[(i, j), 0, 0]) * tXrG[(i, j), 0, 0]
-                    # Use fabs only for max computation, keep signed value in act_result
-                    max_val = max(fabs_f32(act_result[(i, j), 0, 0]), max_val)
+            scales_per_chunk = tXrX.shape[0][1] // 2
+            # Loop Reduce
+            for scale_idx in range(scales_per_chunk):
+                global_scale_idx = chunk_ids * scales_per_chunk + scale_idx
+                max_val: Float32 = 0.0
+                # one thread has 8 element, 16 threads got one scale value
+                # one output int32 has 4 ue8m0 scale
+                # so 2 thread loop will produce 1 int
+                for pos_in_one_scale in cutlass.range_constexpr(2):
+                    j = scale_idx * 2 + pos_in_one_scale
+                    for i in cutlass.range_constexpr(tXrX.shape[0][0]):
+                        act_result = silu(tXrX[(i, j), 0, 0]) * tXrG[(i, j), 0, 0]
+                        # Use fabs only for max computation, keep signed value in act_result
+                        max_val = max(fabs_f32(act_result), max_val)
 
-                max_val = cute.arch.warp_reduction(
-                    max_val,
-                    max,
-                    threads_in_group=16,    # need to be determined in program
-                )
+                    max_val = cute.arch.warp_reduction(
+                        max_val,
+                        max,
+                        threads_in_group=16,    # need to be determined in program
+                    )
 
-                # change division to rcp
-                scale_raw = max(max_val * fp8_max_rcp, eps)
-                scale_ue8m0 = cvt_f32_to_ue8m0(scale_raw)
-                scale_u8 = Uint8(scale_ue8m0 & Uint32(0xFF))
-                inv_scale = ue8m0_to_output_scale(scale_ue8m0)
+                    # change division to rcp
+                    scale_raw = max(max_val * fp8_max_rcp, eps)
+                    scale_ue8m0 = cvt_f32_to_ue8m0(scale_raw)
+                    scale_u8 = Uint8(scale_ue8m0 & Uint32(0xFF))
+                    inv_scale = ue8m0_to_output_scale(scale_ue8m0)
 
-                # quant_each_value
-                for i in cutlass.range_constexpr(tXrX.shape[0][0]):
-                    quant_out_f32 = fp8_quant_and_clamp(act_result[(i, j), 0, 0], inv_scale)
-                    # output e4m3 as uint8
-                    quant_out_fp8 = cvt_f32_to_e4m3(quant_out_f32)
+                    # quant_each_value
+                    for i in cutlass.range_constexpr(tXrX.shape[0][0]):
+                        act_result = silu(tXrX[(i, j), 0, 0]) * tXrG[(i, j), 0, 0]
+                        quant_out_f32 = fp8_quant_and_clamp(act_result, inv_scale)
+                        # output e4m3 as uint8
+                        quant_out_fp8 = cvt_f32_to_e4m3(quant_out_f32)
 
-                    tXrO[(i, j), 0, 0] = quant_out_fp8
+                        tXrO[(i, j), 0, 0] = quant_out_fp8
 
-                # handling scale
-                if lane_id == 0 or lane_id == 16:
-                    pos = pos_in_one_scale * 2 + lane_id // 16
-                    mS[(pos, token_idx), scale_idx] = scale_u8
+                    # handling scale
+                    if lane_id == 0 or lane_id == 16:
+                        pos = pos_in_one_scale * 2 + lane_id // 16
+                        mS[(pos, token_idx), global_scale_idx] = scale_u8
 
-        if row_in_bounds:
-            cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
+            if row_in_bounds:
+                cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
 
 
 def fused_silu_mul_fp8_quant_packed(
