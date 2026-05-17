@@ -13,6 +13,8 @@ constexpr int kWarpSize = 32;
 constexpr int kBlockSize = 16;
 constexpr int kGroupSize = kWarpSize * kBlockSize;
 constexpr int kColumnsPerWarp = 2;
+constexpr int kMaxDownWarpsPerCta = 8;
+constexpr int kTargetDownCtasPerSm = 8;
 
 bool is_aligned(const void* ptr, uintptr_t alignment) {
   return (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1)) == 0;
@@ -145,7 +147,10 @@ __device__ __forceinline__ float warp_sum(float x) {
 }
 
 template <int I, int kTopK>
-__global__ __launch_bounds__(32, 16) void moe_down_combine_nvfp4_kernel(
+__global__ __launch_bounds__(
+    kMaxDownWarpsPerCta * kWarpSize,
+    kTargetDownCtasPerSm)
+void moe_down_combine_nvfp4_kernel(
     const __nv_bfloat16* __restrict__ x,
     const uint8_t* __restrict__ w,
     const uint8_t* __restrict__ w_scale,
@@ -156,12 +161,16 @@ __global__ __launch_bounds__(32, 16) void moe_down_combine_nvfp4_kernel(
     int H,
     int E) {
   static_assert(I % kGroupSize == 0, "I must be a multiple of 512");
+  static_assert(kTopK <= kMaxDownWarpsPerCta, "topk exceeds CTA warp budget");
   constexpr int kGroups = I / kGroupSize;
+
+  __shared__ float partials[2 * kMaxDownWarpsPerCta];
 
   int out_h0 = blockIdx.x * kColumnsPerWarp;
   int out_h1 = out_h0 + 1;
   int token = blockIdx.y;
-  int lane = threadIdx.x;
+  int lane = threadIdx.x & (kWarpSize - 1);
+  int route = threadIdx.x / kWarpSize;
 
   if (token >= B || out_h1 >= H) {
     return;
@@ -170,13 +179,8 @@ __global__ __launch_bounds__(32, 16) void moe_down_combine_nvfp4_kernel(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
 
-#pragma unroll
-  for (int route = 0; route < kTopK; ++route) {
-    int expert = expert_ids[token * kTopK + route];
-    if (expert < 0 || expert >= E) {
-      continue;
-    }
-
+  int expert = expert_ids[token * kTopK + route];
+  if (expert >= 0 && expert < E) {
     float route_weight = route_weights[token * kTopK + route];
     const __nv_bfloat16* x_route =
         x + (static_cast<int64_t>(token) * kTopK + route) * I;
@@ -221,9 +225,22 @@ __global__ __launch_bounds__(32, 16) void moe_down_combine_nvfp4_kernel(
   acc1 = warp_sum(acc1);
 
   if (lane == 0) {
-    int64_t out_base = static_cast<int64_t>(token) * H;
-    out[out_base + out_h0] = __float2bfloat16_rn(acc0);
-    out[out_base + out_h1] = __float2bfloat16_rn(acc1);
+    partials[route] = acc0;
+    partials[kMaxDownWarpsPerCta + route] = acc1;
+  }
+  __syncthreads();
+
+  if (route == 0) {
+    float combined0 = lane < kTopK ? partials[lane] : 0.0f;
+    float combined1 = lane < kTopK ? partials[kMaxDownWarpsPerCta + lane] : 0.0f;
+    combined0 = warp_sum(combined0);
+    combined1 = warp_sum(combined1);
+
+    if (lane == 0) {
+      int64_t out_base = static_cast<int64_t>(token) * H;
+      out[out_base + out_h0] = __float2bfloat16_rn(combined0);
+      out[out_base + out_h1] = __float2bfloat16_rn(combined1);
+    }
   }
 }
 
@@ -239,7 +256,7 @@ void launch_moe_down_combine_nvfp4_kernel(
     int H,
     int E) {
   dim3 grid(H / kColumnsPerWarp, B);
-  dim3 block(kWarpSize);
+  dim3 block(kTopK * kWarpSize);
   auto stream = at::cuda::getCurrentCUDAStream();
 
   moe_down_combine_nvfp4_kernel<I, kTopK><<<grid, block, 0, stream>>>(
@@ -302,6 +319,7 @@ void moe_down_combine_nvfp4_out(
 
   TORCH_CHECK(B > 0, "B must be positive");
   TORCH_CHECK(H > 0 && H % kColumnsPerWarp == 0, "H must be a positive multiple of 2");
+  TORCH_CHECK(topk > 0 && topk <= kMaxDownWarpsPerCta, "topk must be in [1, 8]");
   TORCH_CHECK(I % kGroupSize == 0, "I must be a multiple of 512");
   TORCH_CHECK(w.size(2) == I / 2, "w I/2 mismatch");
   TORCH_CHECK(w_scale.size(0) == E, "w_scale E mismatch");
