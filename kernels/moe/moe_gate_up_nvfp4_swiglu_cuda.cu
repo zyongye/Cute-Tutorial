@@ -172,7 +172,7 @@ __device__ __forceinline__ float warp_sum(float x) {
   return x;
 }
 
-template <int B, int H, int I, int E, int kTopK>
+template <int H, int I, int E, int kTopK>
 __global__ __launch_bounds__(256, 6) void moe_gate_up_nvfp4_swiglu_kernel(
     const __nv_bfloat16* __restrict__ x,
     const uint8_t* __restrict__ w,
@@ -191,7 +191,7 @@ __global__ __launch_bounds__(256, 6) void moe_gate_up_nvfp4_swiglu_kernel(
   int warp = tid / kWarpSize;
   int lane = tid & (kWarpSize - 1);
 
-  if (warp >= kTopK || token >= B) {
+  if (warp >= kTopK) {
     return;
   }
 
@@ -328,8 +328,9 @@ __global__ __launch_bounds__(256, 6) void moe_gate_up_nvfp4_swiglu_kernel(
   }
 }
 
-template <int B, int H, int I, int E, int kTopK>
+template <int H, int I, int E, int kTopK>
 void launch_moe_gate_up_nvfp4_swiglu_kernel(
+    int B,
     torch::Tensor x,
     torch::Tensor w,
     torch::Tensor w_scale,
@@ -340,7 +341,7 @@ void launch_moe_gate_up_nvfp4_swiglu_kernel(
   dim3 block(kTopK * kWarpSize);
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  moe_gate_up_nvfp4_swiglu_kernel<B, H, I, E, kTopK>
+  moe_gate_up_nvfp4_swiglu_kernel<H, I, E, kTopK>
       <<<grid, block, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
       w.data_ptr<uint8_t>(),
@@ -396,6 +397,7 @@ void moe_gate_up_nvfp4_swiglu_out(
   int I = two_I / 2;
   int topk = static_cast<int>(expert_ids.size(1));
 
+  TORCH_CHECK(B > 0, "B must be positive");
   TORCH_CHECK(two_I % 2 == 0, "w.size(1) must be even");
   TORCH_CHECK(H % kGroupSize == 0, "H must be a multiple of 512");
   TORCH_CHECK(w.size(2) == H / 2, "w shape mismatch");
@@ -409,27 +411,27 @@ void moe_gate_up_nvfp4_swiglu_out(
   TORCH_CHECK(out.size(2) == I, "out I mismatch");
   TORCH_CHECK(topk > 0 && topk * kWarpSize <= 1024, "unsupported topk");
 
-#define LAUNCH_FOR_H(BV, HV, IV, EV, TV)                                      \
-  launch_moe_gate_up_nvfp4_swiglu_kernel<BV, HV, IV, EV, TV>(                 \
-      x, w, w_scale, alpha, expert_ids, out)
+#define LAUNCH_FOR_H(HV, IV, EV, TV)                                          \
+  launch_moe_gate_up_nvfp4_swiglu_kernel<HV, IV, EV, TV>(                     \
+      B, x, w, w_scale, alpha, expert_ids, out)
 
-#define DISPATCH_H(BV, IV, EV, TV)                                            \
+#define DISPATCH_H(IV, EV, TV)                                                \
   do {                                                                        \
     switch (H) {                                                              \
       case 512:                                                               \
-        LAUNCH_FOR_H(BV, 512, IV, EV, TV);                                    \
+        LAUNCH_FOR_H(512, IV, EV, TV);                                        \
         break;                                                                \
       case 1024:                                                              \
-        LAUNCH_FOR_H(BV, 1024, IV, EV, TV);                                   \
+        LAUNCH_FOR_H(1024, IV, EV, TV);                                       \
         break;                                                                \
       case 2048:                                                              \
-        LAUNCH_FOR_H(BV, 2048, IV, EV, TV);                                   \
+        LAUNCH_FOR_H(2048, IV, EV, TV);                                       \
         break;                                                                \
       case 3072:                                                              \
-        LAUNCH_FOR_H(BV, 3072, IV, EV, TV);                                   \
+        LAUNCH_FOR_H(3072, IV, EV, TV);                                       \
         break;                                                                \
       case 4096:                                                              \
-        LAUNCH_FOR_H(BV, 4096, IV, EV, TV);                                   \
+        LAUNCH_FOR_H(4096, IV, EV, TV);                                       \
         break;                                                                \
       default:                                                                \
         TORCH_CHECK(                                                          \
@@ -440,24 +442,22 @@ void moe_gate_up_nvfp4_swiglu_out(
     }                                                                         \
   } while (false)
 
-  if (B == 32 && I == 1536 && E == 256 && topk == 8) {
-    DISPATCH_H(32, 1536, 256, 8);
-  } else if (B == 4 && I == 128 && E == 16 && topk == 4) {
-    DISPATCH_H(4, 128, 16, 4);
-  } else if (B == 2 && I == 64 && E == 8 && topk == 2) {
-    DISPATCH_H(2, 64, 8, 2);
+  if (I == 1536 && E == 256 && topk == 8) {
+    DISPATCH_H(1536, 256, 8);
+  } else if (I == 128 && E == 16 && topk == 4) {
+    DISPATCH_H(128, 16, 4);
+  } else if (I == 64 && E == 8 && topk == 2) {
+    DISPATCH_H(64, 8, 2);
   } else {
     TORCH_CHECK(
         false,
-        "unsupported shape B=",
-        B,
-        " I=",
+        "unsupported shape I=",
         I,
         " E=",
         E,
         " topk=",
         topk,
-        "; add a full-shape template specialization");
+        "; add a shape template specialization");
   }
 
 #undef DISPATCH_H
