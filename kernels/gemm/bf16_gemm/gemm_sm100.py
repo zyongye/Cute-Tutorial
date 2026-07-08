@@ -21,15 +21,6 @@ class DenseGEMMSM100:
     
     @cute.jit
     def __call__(self, mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
-        # print(f"[DSL INFO]: mA = {mA}")
-        # gA_tiled = cute.tiled_divide(mA, self.mma_tiler_mn)
-        # gA_zipped = cute.zipped_divide(mA, self.mma_tiler_mn)
-        # gA_flat = cute.flat_divide(mA, self.mma_tiler_mn)
-        # gA_logical = cute.logical_divide(mA, self.mma_tiler_mn)
-        # print(f"[DSL INFO]: gA_tiled = {gA_tiled}") 
-        # print(f"[DSL INFO]: gA_zipped = {gA_zipped}") 
-        # print(f"[DSL INFO]: gA_flat = {gA_flat}") 
-        # print(f"[DSL INFO]: gA_logical = {gA_logical}") 
 
         op = tcgen05.MmaF16BF16Op(
             ab_dtype=self.dtype,
@@ -62,7 +53,6 @@ class DenseGEMMSM100:
             self.ab_stages
         )
 
-        # print(f"[DSL INFO]: b_smem_layout = {b_smem_layout}")
 
         a_smem_layout_one_stage = cute.select(a_smem_layout, mode=[0, 1, 2])
         b_smem_layout_one_stage = cute.select(b_smem_layout, mode=[0, 1, 2])
@@ -81,12 +71,10 @@ class DenseGEMMSM100:
         b_tma_atom, b_tma_tensor = cute.nvgpu.make_tiled_tma_atom_B(
             op,
             mB,
-            b_smem_layout,
+            b_smem_layout_one_stage,
             self.mma_tiler_mnk,
             tiled_mma,
         )
-        # print(f"[DSL INFO]: a_tma_atom = {a_tma_atom}")
-        # print(f"[DSL INFO]: a_tma_tensor = {a_tma_tensor}")
 
         grid_shape = cute.ceil_div((*mC.layout.shape, 1), self.mma_tiler_mnk[:2])
         # print(f"[DSL INFO]: grid_shape = {grid_shape}")
@@ -120,7 +108,7 @@ class DenseGEMMSM100:
         @cute.struct
         class SharedStorage:
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stages * 2]
-            acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stages * 2]
+            acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.acc_stage * 2]
             tmem_holding_buf: cutlass.Int32
         
         tidx, _, _ = cute.arch.thread_idx()
@@ -131,6 +119,7 @@ class DenseGEMMSM100:
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
+        # allocate all stages 
         sA = smem.allocate_tensor(
             element_type = self.dtype,
             layout=a_smem_layout.outer,
@@ -186,8 +175,10 @@ class DenseGEMMSM100:
         gB_nkl = cute.local_tile(mB_nkl, self.mma_tiler_mnk, mma_coord_mnk, proj=(None, 1, 1))
         print(f"[DSL INFO]: gB = {gB_nkl}")
         gC_mnl = cute.local_tile(mC_mnl, self.mma_tiler_mnk, mma_coord_mnk, proj=(1, 1, None))
+        print(f"[DSL INFO]: gC_mnl = {gC_mnl}")
 
         thr_mma = tiled_mma.get_slice(0)
+        # using thr_mma to separate mma stages
         tCgA = thr_mma.partition_A(gA_mkl)
         tCgB = thr_mma.partition_B(gB_nkl)
         tCgC = thr_mma.partition_C(gC_mnl)
