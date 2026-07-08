@@ -76,8 +76,8 @@ class DenseGEMMSM100:
             tiled_mma,
         )
 
-        grid_shape = cute.ceil_div((*mC.layout.shape, 1), self.mma_tiler_mnk[:2])
-        # print(f"[DSL INFO]: grid_shape = {grid_shape}")
+        grid_shape = cute.ceil_div(mC.layout.shape, self.mma_tiler_mnk[:2])
+        print(f"[DSL INFO]: grid_shape = {grid_shape}")
         self.kernel(
             tiled_mma,
             a_tma_atom,
@@ -114,8 +114,8 @@ class DenseGEMMSM100:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        bidx, bidy, _ = cute.arch.block_idx()
-        mma_coord_mnk = (bidx, bidy, None)
+        bidx, bidy, bidz = cute.arch.block_idx()
+        mma_coord_mnk = (bidx, bidy, bidz)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -170,11 +170,11 @@ class DenseGEMMSM100:
             barrier_storage=storage.acc_mbar_ptr.data_ptr(),
         ).make_participants()
 
-        gA_mkl = cute.local_tile(mA_mkl, self.mma_tiler_mnk, mma_coord_mnk, proj=(1, None, 1))
+        gA_mkl = cute.local_tile(mA_mkl, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None))
         print(f"[DSL INFO]: gA = {gA_mkl}")
-        gB_nkl = cute.local_tile(mB_nkl, self.mma_tiler_mnk, mma_coord_mnk, proj=(None, 1, 1))
+        gB_nkl = cute.local_tile(mB_nkl, cute.slice_(self.mma_tiler_mnk, (0, None, None)), (None, None, None))
         print(f"[DSL INFO]: gB = {gB_nkl}")
-        gC_mnl = cute.local_tile(mC_mnl, self.mma_tiler_mnk, mma_coord_mnk, proj=(1, 1, None))
+        gC_mnl = cute.local_tile(mC_mnl, cute.slice_(self.mma_tiler_mnk, (None, None, 0)), (None, None, None))
         print(f"[DSL INFO]: gC_mnl = {gC_mnl}")
 
         thr_mma = tiled_mma.get_slice(0)
@@ -230,9 +230,9 @@ class DenseGEMMSM100:
             cutlass.Float32,
         )
         tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_atom, tCtACC_epi[None, 0])
-        print(f"[DSL INFO]: tmem_tiled_copy = {tmem_tiled_copy}")
+        # print(f"[DSL INFO]: tmem_tiled_copy = {tmem_tiled_copy}")
         tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
-        print(f"[DSL INFO]: tmem_thr_copy = {tmem_thr_copy}")
+        # print(f"[DSL INFO]: tmem_thr_copy = {tmem_thr_copy}")
 
         tDtC = tmem_thr_copy.partition_S(tCtACC_epi)
         tDgC = tmem_thr_copy.partition_D(gC_epi)
@@ -243,7 +243,9 @@ class DenseGEMMSM100:
         tCrC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.dtype)
         print(f"[DSL INFO]: tCrC = {tCrC}")
 
-        num_k_tiles = cute.size(gA_mkl, mode=[2])
+        num_k_tiles = cute.size(gA_mkl, mode=[3])
+        tAgA = tAgA[(None, mma_coord_mnk[0], None, mma_coord_mnk[2])]
+        tBgB = tBgB[(None, mma_coord_mnk[1], None, mma_coord_mnk[2])]
         if warp_idx == 0:
             acc_empty = acc_producer.acquire_and_advance()
 
@@ -282,6 +284,7 @@ class DenseGEMMSM100:
         tmem.relinquish_alloc_permit()
         acc_full = acc_consumer.wait_and_advance()
 
+        tDgC = tDgC[None, None, (None, 0, 0, *mma_coord_mnk)]
         for i in cutlass.range(cute.size(tDtC, mode=[2])):
             cute.copy(tmem_tiled_copy, tDtC[None, None, i], tCrACC)
             tCrC.store(tCrACC.load().to(self.dtype))
@@ -297,12 +300,12 @@ def _gemm_bf16(
     B: torch.Tensor,
     C: torch.Tensor,     
 ):
-    M, K = A.shape
-    N, K = B.shape
+    L, M, K = A.shape
+    _, N, K = B.shape
 
-    a_fake = cute_rt.make_fake_tensor(cute.BFloat16, (M, K), stride=(K, 1), assumed_align=16)
-    b_fake = cute_rt.make_fake_tensor(cute.BFloat16, (N, K), stride=(K, 1), assumed_align=16)
-    c_fake = cute_rt.make_fake_tensor(cute.BFloat16, (M, N), stride=(N, 1), assumed_align=16)
+    a_fake = cute_rt.make_fake_tensor(cute.BFloat16, (M, K, L), stride=(K, 1, M * K), assumed_align=16)
+    b_fake = cute_rt.make_fake_tensor(cute.BFloat16, (N, K, L), stride=(K, 1, N * K), assumed_align=16)
+    c_fake = cute_rt.make_fake_tensor(cute.BFloat16, (M, N, L), stride=(N, 1, M * N), assumed_align=16)
 
     compiled_kernel = cute.compile(
         DenseGEMMSM100(a_fake.dtype),
@@ -312,13 +315,13 @@ def _gemm_bf16(
         options="--enable-tvm-ffi",
     )
 
-    compiled_kernel(A, B, C)
+    compiled_kernel(A.permute(1, 2, 0), B.permute(1, 2, 0), C.permute(1, 2, 0))
 
 def gemm_bf16_cutedsl(A: torch.Tensor, B: torch.Tensor):
-    M, _ = A.shape
-    N, _ = B.shape
+    L, M, _ = A.shape
+    L, N, _ = B.shape
 
-    C = torch.empty(M, N, dtype=torch.bfloat16, device=A.device)
+    C = torch.empty(L, M, N, dtype=torch.bfloat16, device=A.device)
 
     _gemm_bf16(
         A, B, C,
@@ -328,15 +331,17 @@ def gemm_bf16_cutedsl(A: torch.Tensor, B: torch.Tensor):
 
 
 def main():
-    M, N, K, L = 8192, 8192, 8192, 256
+    M, N, K, L = 8192, 8192, 8192, 4
     device = "cuda"
 
-    A = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-    B = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    A = torch.randn(L, M, K, dtype=torch.bfloat16, device=device)
+    B = torch.randn(L, N, K, dtype=torch.bfloat16, device=device)
     
     C = gemm_bf16_cutedsl(A, B)
 
-    torch.testing.assert_close(C, A@B.T)
+    C_ref = torch.bmm(A, B.transpose(1, 2))
+
+    torch.testing.assert_close(C, C_ref)
     
 
 if __name__ == "__main__":
