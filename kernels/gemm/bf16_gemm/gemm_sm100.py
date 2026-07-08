@@ -1,4 +1,8 @@
+from functools import cache
+
 import torch
+
+import triton
 
 import cutlass
 import cutlass.cute as cute
@@ -293,7 +297,21 @@ class DenseGEMMSM100:
 
         pipeline.sync(barrier_id = 1)
         tmem.free(tmem_ptr)
+    
+    @cache
+    @staticmethod
+    def compile(dtype, M, N, K, L):
+        a_fake = cute_rt.make_fake_tensor(cute.BFloat16, (M, K, L), stride=(K, 1, M * K), assumed_align=16)
+        b_fake = cute_rt.make_fake_tensor(cute.BFloat16, (N, K, L), stride=(K, 1, N * K), assumed_align=16)
+        c_fake = cute_rt.make_fake_tensor(cute.BFloat16, (M, N, L), stride=(N, 1, M * N), assumed_align=16)
 
+        return cute.compile(
+            DenseGEMMSM100(a_fake.dtype),
+            a_fake,
+            b_fake,
+            c_fake,
+            options="--enable-tvm-ffi",
+        )
 
 def _gemm_bf16(
     A: torch.Tensor,
@@ -303,31 +321,32 @@ def _gemm_bf16(
     L, M, K = A.shape
     _, N, K = B.shape
 
-    a_fake = cute_rt.make_fake_tensor(cute.BFloat16, (M, K, L), stride=(K, 1, M * K), assumed_align=16)
-    b_fake = cute_rt.make_fake_tensor(cute.BFloat16, (N, K, L), stride=(K, 1, N * K), assumed_align=16)
-    c_fake = cute_rt.make_fake_tensor(cute.BFloat16, (M, N, L), stride=(N, 1, M * N), assumed_align=16)
-
-    compiled_kernel = cute.compile(
-        DenseGEMMSM100(a_fake.dtype),
-        a_fake,
-        b_fake,
-        c_fake,
-        options="--enable-tvm-ffi",
+    kernel = DenseGEMMSM100.compile(
+        A.dtype,
+        M, 
+        N, 
+        K, 
+        L,
     )
 
-    compiled_kernel(A.permute(1, 2, 0), B.permute(1, 2, 0), C.permute(1, 2, 0))
+    kernel(A.permute(1, 2, 0), B.permute(1, 2, 0), C.permute(1, 2, 0))
 
-def gemm_bf16_cutedsl(A: torch.Tensor, B: torch.Tensor):
+
+def gemm_bf16_cutedsl(A: torch.Tensor, B: torch.Tensor, bench: bool = True):
     L, M, _ = A.shape
     L, N, _ = B.shape
 
     C = torch.empty(L, M, N, dtype=torch.bfloat16, device=A.device)
-
-    _gemm_bf16(
-        A, B, C,
-    )
+    _gemm_bf16(A, B, C,) 
     
-    return C
+    if bench:
+        time_ms = triton.testing.do_bench(
+            lambda: _gemm_bf16(A, B, C,), rep = 100
+        )
+        return C, time_ms
+
+    return C, None
+    
 
 
 def main():
@@ -337,9 +356,16 @@ def main():
     A = torch.randn(L, M, K, dtype=torch.bfloat16, device=device)
     B = torch.randn(L, N, K, dtype=torch.bfloat16, device=device)
     
-    C = gemm_bf16_cutedsl(A, B)
+    C, time_ms = gemm_bf16_cutedsl(A, B)
+    print(f"time: {time_ms}")
 
     C_ref = torch.bmm(A, B.transpose(1, 2))
+
+    time_ref = triton.testing.do_bench(
+        lambda: torch.bmm(A, B.transpose(1, 2)), rep = 100
+    )
+    print(f"time ref: {time_ref}")
+
 
     torch.testing.assert_close(C, C_ref)
     
