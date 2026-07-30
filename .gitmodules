@@ -1,0 +1,3 @@
+[submodule "CuTe"]
+	path = CuTe
+	url = git@github.com:NVlabs/CuTe.git
